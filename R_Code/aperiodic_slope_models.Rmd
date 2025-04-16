@@ -1,0 +1,708 @@
+---
+title: "Modelling aperiodic activity"
+author: "Zachariah R Cross"
+date: "2023-10-27"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Load packages
+
+```{r setup, include=FALSE}
+
+# apply global settings
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
+
+# load packages
+library(tidyverse)
+library(Rmisc)
+library(RColorBrewer)
+library(hrbrthemes)
+library(sjmisc)
+library(sjlabelled)
+library(lme4)
+library(lmerOut)
+library(lmerTest)
+library(car)
+library(ggeffects)
+library(performance)
+library(ggpubr)
+library(rempsyc)
+library(ggExtra)
+library(broom)
+library(plotly)
+library(emmeans)
+library(purrr)
+library(rempsyc)
+library(ggseg)
+library(ggsegDKT)
+library(forcats)
+library(ggridges)
+library(viridis)
+library(splines)
+
+# set contrasts
+options(contrasts=c("contr.Sum","contr.Helmert"))
+options(decorate.contr.Sum="",decorate.contrasts=c("[","]"))
+
+# functioning for modifying tick labels
+number_ticks <- function(n) {function(limits) pretty(limits, n)}
+
+```
+
+## Read in data
+
+```{r load data}
+
+average_df <- read.csv("aperiodic_slope_models.csv") %>% 
+  select(-X)
+
+```
+
+# ridge line plots to show distribution
+
+```{r ridgeline}
+
+# Convert DKT to factor with reverse alphabetical order
+average_df$DKT <- factor(average_df$DKT, levels = rev(unique(average_df$DKT[order(average_df$DKT)])))
+
+# Plot with reverse alphabetically ordered DKT
+ggplot(average_df, aes(x = Slope, y = DKT, fill = ..x..)) +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+  scale_fill_viridis(name = "Slope", option = "C") +
+  labs(y = "", x = "Aperiodic Slope") +
+  facet_grid(~condition) +
+  theme_minimal() +
+  theme(
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x = element_text(size = 14, colour = "black"),
+    strip.text.y = element_text(size = 14, colour = "black"),
+    legend.position = "none",
+    legend.spacing.x = unit(0.2, 'cm'),
+    legend.key.size = unit(0.4, "cm"),
+    legend.background = element_rect(fill = alpha('blue', 0)),
+    legend.text = element_text(size = 10, colour = "black"),
+    legend.title = element_text(size = 10, colour = "black", face = "bold"),
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 14),
+    plot.title = element_text(size = 12, face = "bold"))
+
+# generate ridge line plot for offset
+ggplot(average_df, aes(x = Offset, y = DKT, fill = ..x..)) +
+  geom_density_ridges_gradient(scale = 3, rel_min_height = 0.01) +
+  scale_fill_viridis(name = "Offset", option = "C") +
+  labs(y="", x = "Aperiodic Offset") +
+  facet_grid(~condition) +
+  theme_minimal() +
+    theme(legend.position="none",
+      panel.spacing = unit(0.1, "lines"),
+      strip.text.x = element_text(size = 8)) +  
+  theme(legend.position="NONE",
+        legend.spacing.x = unit(0.2, 'cm'),
+        legend.key.size = unit(0.4, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 10, colour = "black", face = "bold"),
+        strip.text.x = element_text(size = 14, colour = "black"),
+        strip.text.y = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, face = "bold"))
+
+```
+
+## Get demographic information
+
+```{r data frame aperiodic}
+
+# get number of males/females by condition
+sex_condition <- average_df %>%
+  ungroup() %>% 
+  select(subj, sex, age) %>%
+  group_by(sex, subj) %>% 
+  dplyr::summarise(age = mean(age)) %>% 
+  dplyr::count(sex, sort = TRUE)
+
+# make unique subjects a data frame
+subj_list <- unique(average_df$subj)
+subj_list <- as.data.frame(subj_list)
+
+# check length of channels
+length(unique(average_df$realID))
+
+# get information for age
+summary(average_df$age)
+
+# remove subcortical bc not enough observations for model
+average_df <- average_df %>% 
+  filter(DKT != "subcortical")
+
+```
+
+# Run large mixed model to test hypotheses A and B
+
+```{r lmer analysis}
+
+large_df <- average_df %>%
+  filter(DKT != "amygdala" & DKT != "hippocampus") %>%
+  select(Slope, Offset, subj, DKT, age, realID) %>%
+  mutate(Cortex = case_when(
+    DKT %in% c("caudal middle frontal", "insula", "caudal anterior cingulate",
+               "fusiform", "inferior temporal", "inferior parietal", 
+               "superior temporal", "middle temporal", "parahippocampal", 
+               "rostral middle frontal", "posterior cingulate", 
+               "superior parietal", "medial orbitofrontal", 
+               "inferior frontal", "lateral orbitofrontal", "temporal pole") ~ "Association",
+    DKT %in% c("postcentral", "precentral", "lateral occipital") ~ "Sensorimotor",
+    TRUE ~ NA_character_  # In case there are other regions not covered
+  )) %>%
+  group_by(subj, realID, Cortex, DKT) %>%
+  dplyr::summarise(Slope = mean(Slope),
+                   Offset = mean(Offset),
+                   age = mean(age)) %>% 
+  na.omit()
+
+large_df$subj <- as.factor(large_df$subj)
+large_df$realID <- as.factor(large_df$realID)
+large_df$Cortex <- as.factor(large_df$Cortex)
+large_df$DKT <- as.factor(large_df$DKT)
+
+# Mixed effects model for slope
+large_model_slope <- lmer(Slope ~ ns(age,2) * Cortex + (1|subj) + (1|DKT), data = large_df, control = lmerControl(optimizer = "bobyqa"))
+summary(large_model_slope)
+
+# Plot interaction for slope model
+data_slope <- ggemmeans(large_model_slope, terms = c("age [all]", "Cortex"),
+                     ci.lvl = 0.83) %>% 
+  dplyr::rename(Slope = predicted, age = x, Cortex = group)
+
+ggplot(data_slope, aes(age, Slope, color = Cortex)) +
+  geom_path(aes()) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = Cortex), alpha = 0.4) +
+  #scale_y_continuous(limits = c(1.70, 2.7), breaks = seq(1.70, 2.70, by = .20)) +
+  #scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 5)) +
+  ylab("Aperiodic Slope") +
+  xlab("Age [years]") +
+  scale_color_manual(values = c("turquoise4", "tan1")) + # Adjust colors as needed
+  scale_fill_manual(values = c("turquoise4", "tan1")) + # Adjust colors as needed for ribbon
+  theme_classic() +  
+  theme(legend.position = "top",
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        strip.text.x = element_text(size = 12),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+# Define the age values you want to compare
+age_vals_slope <- seq(5.93, 54, by = 10)
+
+# Run the emmeans function with the specified age values
+em_slope <- emmeans(large_model_slope, pairwise ~ age * Cortex, 
+                    at = list(age = age_vals_slope), 
+                    type = "response", adjust = "none")
+em_slope
+
+# Mixed effects model for offset
+large_model_offset <- lmer(Offset ~ ns(age,2) * Cortex + (1|subj) + (1|DKT), data = large_df, control = lmerControl(optimizer = "bobyqa"))
+summary(large_model_offset)
+
+# extract predicted effects for offset
+data_offset <- ggemmeans(large_model_offset, terms = c("age [all]", "Cortex"),
+                     ci.lvl = 0.83) %>% 
+  dplyr::rename(Offset = predicted, age = x, Cortex = group)
+
+# plot for offset
+ggplot(data_offset, aes(age, Offset, color = Cortex)) +
+  geom_path(aes()) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = Cortex), alpha = 0.4) +
+  #scale_y_continuous(limits = c(1.70, 2.7), breaks = seq(1.70, 2.7, by = .20)) +
+  #scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 5)) +
+  ylab("Aperiodic Offset") +
+  xlab("Age [years]") +
+  scale_color_manual(values = c("turquoise4", "tan1")) + # Adjust colors as needed
+  scale_fill_manual(values = c("turquoise4", "tan1")) + # Adjust colors as needed for ribbon
+  theme_classic() +  
+  theme(legend.position = "top",
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        strip.text.x = element_text(size = 12),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+```
+
+## Run mixed-effects models and extract predicted effects for slope
+
+```{r lmer loop through each ROI for slope}
+
+# Linear mixed-effects model function for looping over DKT regions
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  if (nrow(data) == 0) {
+    cat("Skipping: no non-NA data available for this DKT region.\n")
+    return(data.frame())  # Return an empty data frame if no data
+  }
+  
+  model <- lmer(Slope ~ age * condition + (1 | subj/realID) + (1|task), data = data,
+                control = lmerControl(optimizer = "bobyqa"))
+  emm <- ggemmeans(model, terms = c("age [all]", "condition"), ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(average_df$DKT)
+combined_results <- data.frame()  # Create an empty data frame for combined results
+results_df_slope <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- average_df[average_df$DKT == level, ]
+  
+  # Print the number of rows and a sample of the subset data for debugging
+  cat("Number of rows in subset_data:", nrow(subset_data), "\n")
+  print(head(subset_data))
+  
+  # Check if there's enough data to run the model
+  if (nrow(subset_data) < 5) {  # Threshold can be adjusted as needed
+    cat("Skipping:", level, "- Not enough data.\n")
+    next  # Skip this iteration if not enough data
+  }
+  
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  if (nrow(results) == 0) {
+    cat("Skipping:", level, "- No results returned.\n")
+    next  # Skip if no results returned
+  }
+  
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results <- rbind(combined_results, results)
+  
+  # Run lmer model for slope results
+  model <- lmer(Slope ~ age * condition + (1 | subj/realID) + (1|task), data = subset_data,
+                control = lmerControl(optimizer = "bobyqa"))
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for slope
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Age = fixed_effects[1, "Estimate"],
+    SE_Age = fixed_effects[1, "Std. Error"],
+    PValue_Age = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_Condition = fixed_effects[2, "Estimate"],
+    SE_Condition = fixed_effects[2, "Std. Error"],
+    PValue_Condition = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for slope
+  results_df_slope <- rbind(results_df_slope, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results <- combined_results %>% 
+  rename(Slope = predicted, age = x, condition = group)
+
+# Generate table of all results for aperiodic slope
+slope_table <- results_df_slope %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_Condition = PValue_Condition,
+                P_Interaction = PValue_Interaction)
+
+# Apply FDR correction
+results_df_slope$p_age_corrected <- p.adjust(results_df_slope$PValue_Age, method = "fdr")
+results_df_slope$p_condition_corrected <- p.adjust(results_df_slope$PValue_Condition, method = "fdr")
+results_df_slope$p_interaction_corrected <- p.adjust(results_df_slope$PValue_Interaction, method = "fdr")
+
+```
+
+# Plot main effects for slope
+
+```{r slope main effects}
+
+# age data frame for plotting
+age_df <- average_df %>% 
+  select(subj, DKT, Slope, age) %>% 
+  group_by(subj, DKT) %>% 
+  summarise(Slope = mean(Slope),
+            age = mean(age))
+
+# rostral middle frontal gyrus
+ggplot(age_df, aes(x = age, y = Slope)) + 
+  geom_point(color = "brown3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  #scale_y_continuous(limits = c(1, 3), breaks = seq(1, 3, by = .5)) +
+  #scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  scale_color_viridis_c(option = "magma") +
+  ylab("Aperiodic Slope") + xlab ("Age [Years]") +
+  theme_classic() +
+  facet_wrap(~DKT) +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# condition data frame for plotting
+condition_df <- average_df %>% 
+  select(subj, DKT, Slope, age, condition) %>% 
+  group_by(subj, DKT, condition) %>% 
+  summarise(Slope = mean(Slope),
+            age = mean(age))
+
+# raincloud plot for condition main effect
+ggplot(condition_df, aes(y = Slope, x = condition, fill = condition)) +
+  geom_flat_violin(aes(fill = condition), position = position_nudge(x = .2, y = 0), adjust = 1.5, trim = FALSE, alpha = .5, colour = NA) +
+  geom_line(aes(group = condition), alpha = 0.2, colour = "gray48", size = .8, position = position_dodge(0.3)) +
+  geom_boxplot(aes(x = condition, y = Slope, fill = condition), outlier.shape = NA, alpha = .5, width = .2, linewidth = .8, position = position_nudge(x = 0, y = 0), colour = "black") +
+  scale_y_continuous(limits = c(0.5, 3.5), breaks = seq(0.5, 3.5, by = .5)) +
+  facet_wrap(~DKT) +
+  ylab("Aperiodic Slope") + xlab("") +
+  scale_color_manual(values = c("turquoise4", "tan1")) +
+  scale_fill_manual(values = c("turquoise4", "tan1")) +
+  theme_bw() +
+  theme(legend.position = "NONE",
+        legend.spacing.x = unit(0.2, 'cm'),
+        legend.key.size = unit(0.4, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 10, colour = "black", face = "bold"),
+        strip.text.x = element_text(size = 14, colour = "black"),
+        strip.text.y = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, face = "bold"))
+
+```
+
+# Prepare cortical atlas plots
+
+```{r prepare cortical atlas}
+
+# Load the DKT atlas data
+data("dkt")
+regions <- dkt[["data"]][["region"]]
+regions <- as.data.frame(regions)
+regions <- unique(regions)
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("lateral occipital",         # 1
+                         "lateral occipital",         # 2
+                         "parahippocampal",           # 3
+                         "posterior cingulate",       # 4
+                         "precentral",                # 5
+                         "inferior frontal",          # 6
+                         "inferior frontal",          # 7
+                         "inferior frontal",          # 8
+                         "lateral occipital",         # 9
+                         "superior parietal",         # 10
+                         "superior parietal",         # 11
+                         "temporal pole",             # 12
+                         "superior temporal",         # 13
+                         "caudal middle frontal",     # 14
+                         "caudal anterior cingulate", # 15
+                         "hippocampus",               # 16
+                         "amygdala")                  # 17
+
+new_labels <- c("lingual",                            # 1
+                "cuneus",                             # 2
+                "entorhinal",                         # 3
+                "isthmus cingulate",                  # 4
+                "paracentral",                        # 5
+                "pars opercularis",                   # 6
+                "pars triangularis",                  # 7
+                "pars orbitalis",                     # 8
+                "pericalcarine",                      # 9
+                "precuneus",                          # 10
+                "supramarginal",                      # 11
+                "middle temporal",                    # 12
+                "transverse temporal",                # 13
+                "superior frontal",                   # 14
+                "rostral anterior cingulate",         # 15
+                "entorhinal",                         # 16
+                "entorhinal")                         # 17
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Duplicate the entire data frame
+df_duplicated_slope <- bind_rows(replicate(3, results_df_slope, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_slope <- df_duplicated_slope %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_slope <- bind_rows(df_duplicated_slope, results_df_slope)
+df_final_slope <- distinct(df_final_slope)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+slope_tibble <- tibble(df_final_slope) %>%
+  select(DKT, PValue_Interaction, Estimate_Interaction) %>% 
+  filter(DKT != "inferior frontal" & DKT != "temporal pole" & DKT != "subcortical") %>%
+  rename(region = DKT, p = PValue_Interaction, B = Estimate_Interaction)
+
+# Apply FDR correction
+slope_tibble$p_corrected <- p.adjust(slope_tibble$p, method = "fdr")
+
+```
+
+# Generate cortical atlas plots
+
+```{r cortical atlas plots}
+
+# same thing but with continuous scale
+ggplot(slope_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = B, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  scale_fill_viridis_c(option = "magma") +  # Use inferno palette
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Plot condition x age interaction for slope
+## be sure to replace the roi's when running the code
+
+```{r plot slope interaction}
+
+mod_plot <- lmer(Slope ~ age * condition + (1 | subj/realID) + (1|task), 
+                 data = filter(average_df, DKT == "rostral middle frontal"),
+                control = lmerControl(optimizer = "bobyqa"))
+summary(mod_plot)
+
+raw_data_plot <- average_df %>% 
+  ungroup() %>% 
+  select(subj, DKT, Slope, age, condition) %>% 
+  group_by(subj, DKT, condition) %>% 
+  summarise_all(funs(mean), na.rm = TRUE)
+
+# Plot interaction
+emm_plot_interaction <- ggemmeans(mod_plot, terms = c("age", "condition"),
+                     ci.lvl = 0.83) %>% 
+  rename(Slope = predicted, age = x, condition = group)
+
+ggplot(emm_plot_interaction, aes(age, Slope, color = condition)) +
+  geom_path(aes()) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = condition), alpha = 0.4) +
+  geom_point(data = filter(raw_data_plot, DKT == "rostral middle frontal"),
+             aes(y = Slope, color = condition), position = position_jitter(width = .20), 
+             size = 3, alpha = 0.3) +
+  scale_y_continuous(limits = c(1, 3), breaks = seq(1, 3, by = .5)) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  ylab("Aperiodic Slope") +
+  xlab("Age [years]") +
+  scale_color_manual(values = c("grey49", "#c41e3a")) + # Adjust colors as needed
+  scale_fill_manual(values = c("grey49", "#c41e3a")) + # Adjust colors as needed for ribbon
+  theme_classic() +  
+  theme(legend.position = "top",
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        strip.text.x = element_text(size = 12),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank())
+
+```
+
+# Aperiodic slope across the cortex
+
+```{r cortex slope}
+
+# Recoded DKT variable with sum-to-zero contrast coding
+average_df$DKT_contrast <- contr.sum(average_df$DKT)
+
+# Run mixed-effects model for slope
+roi_model <- lmer(Slope ~ DKT + condition + age + (1 | subj/realID) + (1 | task), 
+                  data = average_df, control = lmerControl(optimizer = "bobyqa"))
+Anova(roi_model)
+
+# Extract predicted effects
+emm_roi <- ggemmeans(roi_model, terms = "DKT",
+                     ci.lvl = 0.83) %>% 
+  dplyr::rename(Slope = predicted, DKT = x)
+
+# Generate average data frame for plotting raw data
+roi_average <- average_df %>% 
+  ungroup() %>% 
+  select(subj, DKT, Slope) %>% 
+  group_by(subj, DKT) %>% 
+  summarise_all(funs(mean), na.rm = TRUE)
+
+# re-order the levels of DKT
+desired_order <- rev(c("caudal anterior cingulate",
+                       "inferior frontal",
+                       "lateral orbitofrontal",
+                       "medial orbitofrontal",
+                       "caudal middle frontal",
+                       "rostral middle frontal",
+                       "precentral",
+                       "postcentral",
+                       "insula",
+                       "subcortical",
+                       "inferior parietal",
+                       "superior parietal",
+                       "inferior temporal",
+                       "middle temporal",
+                       "superior temporal",
+                       "temporal pole",
+                       "fusiform",
+                       "parahippocampal",
+                       "hippocampus",
+                       "amygdala",
+                       "posterior cingulate",
+                       "lateral occipital"
+                      ))
+
+# Convert x to a factor with desired order of levels
+emm_roi$DKT <- factor(emm_roi$DKT, levels = desired_order)
+roi_average$DKT <- factor(roi_average$DKT, levels = desired_order)
+
+# convert to a data frame so then we can plot on cortex
+emm_roi <- as.data.frame(emm_roi)
+whole_slope <- emm_roi %>% 
+  select(DKT, Slope)
+
+# Duplicate the entire data frame to match the DKT levels
+df_whole_cortex <- bind_rows(replicate(3, whole_slope, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_whole_cortex <- df_whole_cortex %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_slope <- bind_rows(df_whole_cortex, whole_slope)
+df_final_slope <- distinct(df_final_slope)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+slope_tibble <- tibble(df_final_slope) %>%
+  filter(DKT != "inferior frontal" & DKT != "subcortical") %>%
+  rename(region = DKT)
+
+# plot on the ggseg DKT atlas
+ggplot(slope_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = Slope, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  scale_fill_viridis_c(option = "magma", limits = c(1.8, 2.3)) +  # Use inferno palette with specified limits
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Aperiodic offset across the cortex
+
+```{r cortex offset}
+
+# Run mixed-effects model for slope
+roi_model <- lmer(Offset ~ DKT + condition + age + (1 | subj/realID) + (1|task), 
+                  data = average_df, control = lmerControl(optimizer = "bobyqa"))
+Anova(roi_model)
+
+# Extract predicted effects
+emm_roi <- ggemmeans(roi_model, terms = "DKT",
+                     ci.lvl = 0.83) %>% 
+  dplyr::rename(Offset = predicted, DKT = x)
+
+# Generate average data frame for plotting raw data
+roi_average <- average_df %>% 
+  ungroup() %>% 
+  select(subj, DKT, Offset) %>% 
+  group_by(subj, DKT) %>% 
+  summarise_all(funs(mean), na.rm = TRUE)
+
+# Convert x to a factor with desired order of levels
+emm_roi$DKT <- factor(emm_roi$DKT, levels = desired_order)
+roi_average$DKT <- factor(roi_average$DKT, levels = desired_order)
+
+# convert to a data frame to plot on cortex
+emm_roi <- as.data.frame(emm_roi)
+whole_Offset <- emm_roi %>% 
+  select(DKT, Offset)
+
+# Duplicate the entire data frame
+df_whole_cortex <- bind_rows(replicate(3, whole_Offset, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_whole_cortex <- df_whole_cortex %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_Offset <- bind_rows(df_whole_cortex, whole_Offset)
+df_final_Offset <- distinct(df_final_Offset)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+Offset_tibble <- tibble(df_final_Offset) %>%
+  filter(DKT != "inferior frontal" & DKT != "temporal pole" & DKT != "subcortical") %>%
+  rename(region = DKT)
+
+# plot on ggseg DKT atlas
+ggplot(Offset_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = Offset, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  scale_fill_viridis_c(option = "magma", limits = c(6.1, 7.8)) +  # Use inferno palette
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```

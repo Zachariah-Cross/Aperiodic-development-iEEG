@@ -1,0 +1,1473 @@
+---
+title: "Modelling EEG and gray matter volume"
+author: "Zachariah R. Cross"
+date: "2023-02-23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r load libraries}
+
+library(ggseg)
+library(ggplot2)
+library(tidyverse)
+library(ggseg3d)
+library(hrbrthemes)
+library(sjmisc)
+library(sjlabelled)
+library(lme4)
+library(lmerOut)
+library(lmerTest)
+library(car)
+library(splines)
+library(ggeffects)
+library(performance)
+library(ggpubr)
+library(ggExtra)
+library(broom)
+library(plotly)
+library(emmeans)
+library(purrr)
+library(ggsegDKT)
+
+# set contrasts
+options(contrasts=c("contr.Sum","contr.Helmert"))
+options(decorate.contr.Sum="",decorate.contrasts=c("[","]"))
+
+# functioning for modifying tick labels
+number_ticks <- function(n) {function(limits) pretty(limits, n)}
+
+# set jitter width
+pd_2 <- position_dodge(width = .5)
+
+```
+
+# Outlier detection function
+
+```{r outlier detection function}
+
+# outlier detection function
+outlierKD <- function(dt, var) {
+  var_name <- eval(substitute(var),eval(dt))
+  tot <- sum(!is.na(var_name))
+  na1 <- sum(is.na(var_name))
+  m1 <- mean(var_name, na.rm = T)
+  par(mfrow=c(2, 2), oma=c(0,0,3,0))
+  boxplot(var_name, main="With outliers")
+  hist(var_name, main="With outliers", xlab=NA, ylab=NA)
+  outlier <- boxplot.stats(var_name)$out
+  mo <- mean(outlier)
+  var_name <- ifelse(var_name %in% outlier, NA, var_name)
+  boxplot(var_name, main="Without outliers")
+  hist(var_name, main="Without outliers", xlab=NA, ylab=NA)
+  title("Outlier Check", outer=TRUE)
+  na2 <- sum(is.na(var_name))
+  message("Outliers identified: ", na2 - na1, " from ", tot, " observations")
+  message("Proportion (%) of outliers: ", (na2 - na1) / tot*100)
+  message("Mean of the outliers: ", mo)
+  m2 <- mean(var_name, na.rm = T)
+  message("Mean without removing outliers: ", m1)
+  message("Mean if we remove outliers: ", m2)
+  response <- readline(prompt="Do you want to remove outliers and to replace with NA? [yes/no]: ")
+  if(response == "y" | response == "yes"){
+    dt[as.character(substitute(var))] <- invisible(var_name)
+    assign(as.character(as.list(match.call())$dt), dt, envir = .GlobalEnv)
+    message("Outliers successfully removed", "\n")
+    return(invisible(dt))
+  } else{
+    message("Nothing changed", "\n")
+    return(invisible(var_name))
+  }
+}
+
+# outlier function
+remove_outliers_tukey <- function(x) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = TRUE)
+  H <- 1.5 * IQR(x, na.rm = TRUE)
+  outliers <- sum(x < (qnt[1] - H) | x > (qnt[2] + H), na.rm = TRUE)
+  x[x < (qnt[1] - H)] <- NA
+  x[x > (qnt[2] + H)] <- NA
+  return(list(data = x, outliers = outliers))
+}
+
+```
+
+# Join Gray Matter Volume Estimates
+
+```{r load freesurfer data files and merge}
+
+# directory to where all volume files are (be sure to change to your directory)
+subjects_dir <- "/Volumes/Zach_HD/ieeg_aperiodic/freesurfer_analysis/volumes_stats"
+
+# pull together all volumes
+dat <- read_atlas_files(subjects_dir, "aparc.DKTatlas.stats$")
+
+# tidy up columns
+dat2 <- dat %>% 
+  separate(subject, c("subj", "useless"), "_")
+dat2$hemisphere <- substr(dat2$useless, 0, 2)
+dat2 <- dat2 %>% 
+  select(-useless)
+
+# average over ROIs
+average_gray_vol <- dat2 %>% 
+  select(subj, GrayVol, label, ThickAvg) %>%
+  group_by(subj, label) %>%
+  dplyr::summarise(gmv = mean(GrayVol),
+            thick = mean(ThickAvg))
+
+ggseg_roi <- as.data.frame(unique(average_gray_vol$label))
+
+# relabel label to DKT
+filtered_df <- average_gray_vol %>% 
+  rename(DKT = label)
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("cuneus",                   # 2
+                         "entorhinal",               # 3
+                         "isthmuscingulate",         # 4
+                         "lingual",                  # 5
+                         "paracentral",              # 6
+                         "parsopercularis",          # 7
+                         "parsorbitalis",            # 8
+                         "parstriangularis",         # 9
+                         "pericalcarine",            # 10
+                         "precuneus",                # 11
+                         "rostralanteriorcingulate", # 12
+                         "superiorfrontal",          # 13
+                         "supramarginal",            # 14
+                         "transversetemporal",       # 15
+                         "caudalanteriorcingulate",  # 16
+                         "caudalmiddlefrontal",      # 17
+                         "fusiform",                 # 18
+                         "inferiorparietal",         # 19
+                         "inferiortemporal",         # 20
+                         "insula",                   # 21
+                         "lateraloccipital",         # 22
+                         "lateralorbitofrontal",     # 23
+                         "medialorbitofrontal",      # 24
+                         "middletemporal",           # 25
+                         "parahippocampal",          # 26
+                         "postcentral",              # 27
+                         "posteriorcingulate",       # 28
+                         "precentral",               # 29
+                         "rostralmiddlefrontal",     # 30
+                         "superiorparietal",         # 31
+                         "superiortemporal",         # 32
+                         "temporalpole"              # 33
+                         )                         
+
+new_labels <- c("lateral occipital",                 # 2
+                "parahippocampal",                   # 3
+                "posterior cingulate",               # 4
+                "lateral occipital",                 # 5
+                "precentral",                        # 6
+                "inferior frontal",                  # 7
+                "inferior frontal",                  # 8
+                "inferior frontal",                  # 9
+                "lateral occipital",                 # 10
+                "superior parietal",                 # 11
+                "caudal anterior cingulate",         # 12
+                "caudal middle frontal",             # 13
+                "superior parietal",                 # 14
+                "superior temporal" ,                # 15
+                "caudal anterior cingulate",         # 16
+                "caudal middle frontal",             # 17
+                "fusiform",                          # 18
+                "inferior parietal",                 # 19
+                "inferior temporal",                 # 20
+                "insula",                            # 21
+                "lateral occipital",                 # 22
+                "lateral orbitofrontal",             # 23
+                "medial orbitofrontal",              # 24
+                "middle temporal",                   # 25
+                "parahippocampal",                   # 26
+                "postcentral",                       # 27
+                "posterior cingulate",               # 28
+                "precentral",                        # 29
+                "rostral middle frontal",            # 30
+                "superior parietal",                 # 31
+                "superior temporal",                 # 32
+                "superior temporal"                  # 33
+                )
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Duplicate the entire data frame
+df_duplicated_dkt <- bind_rows(replicate(3, filtered_df, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_dkt <- df_duplicated_dkt %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Calculate the mean of values for each group of duplicated rows
+df_means <- df_duplicated_dkt %>%
+  group_by(DKT, subj) %>%
+  summarise(across(starts_with("gmv"), mean, na.rm = TRUE), .groups = "drop") %>%
+  rename_with(~ paste0(., "_mean"), -DKT) %>% 
+  rename(subj = subj_mean, gmv = gmv_mean)
+
+# join with aperiodic data
+df <- read.csv("aperiodic_final_updated.csv", header = T) %>% 
+  select(subj, realID, DKT, brodmann, sex, Slope, Offset, age, R.2, task) %>% 
+  group_by(subj, realID, DKT, brodmann, sex, task) %>% 
+  filter(R.2 >= .90) %>% 
+  summarise_all(funs(mean), na.rm = FALSE)
+
+# Remove outliers separately for Slope and Offset within each DKT group
+average_df <- df %>%
+  dplyr::group_by(DKT) %>%
+  dplyr::mutate(
+    Slope_no_outliers = remove_outliers_tukey(Slope)$data,
+    Slope_outliers_removed = remove_outliers_tukey(Slope)$outliers,
+    Offset_no_outliers = remove_outliers_tukey(Offset)$data,
+    Offset_outliers_removed = remove_outliers_tukey(Offset)$outliers,
+  ) %>%
+  ungroup()
+# overwrite original aperiodic columns with the outliers removed data
+average_df$Slope <- average_df$Slope_no_outliers
+average_df$Offset <- average_df$Offset_no_outliers
+outlierKD(average_df, Slope)
+outlierKD(average_df, Offset)
+
+# final data frame
+full_data <- left_join(average_df, df_means, by = c("subj","DKT")) %>%
+  complete(DKT = unique(c(average_df$DKT, "subcortical"))) %>%
+  filter(DKT != "Other") %>%
+  select(subj, realID, Slope, Offset, gmv, age, task, DKT, sex) %>%
+  ungroup() %>%
+  group_by(subj, realID, task, DKT, sex) %>%
+  summarise_all(funs(mean), na.rm = FALSE)
+
+# Group by "subj" and "DKT", and find the unique "parahippocampal" gmv value for each "subj"
+parahippocampal_gmv <- full_data %>%
+  dplyr::select(subj, DKT, gmv) %>% 
+  dplyr::filter(DKT == "parahippocampal") %>%
+  dplyr::group_by(subj) %>%
+  summarize(parahippocampal_gmv = unique(gmv))
+
+# Merge the parahippocampal gmv values with the original data frame
+full_data <- full_data %>%
+  left_join(parahippocampal_gmv, by = "subj") %>%
+  mutate(gmv = ifelse(DKT %in% c("hippocampus", "amygdala"), parahippocampal_gmv, gmv)) %>%
+  select(-parahippocampal_gmv)  # Remove the auxiliary column
+
+# Ensure gmv values are not overwritten for parahippocampal
+full_data$gmv[full_data$DKT == "parahippocampal"] <- full_data$gmv[full_data$DKT == "parahippocampal"]  # Optional, just to be explicit
+
+# factorise variables
+full_data$subj <- as.factor(full_data$subj)
+full_data$realID <- as.factor(full_data$realID)
+full_data$DKT <- as.factor(full_data$DKT)
+full_data$task <- as.factor(full_data$task)
+full_data$sex <- as.factor(full_data$sex)
+
+# run this for generating the plots at the end of the script
+full_data2 <- full_data %>% 
+  filter(DKT != "subcortical" & subj != "SD3")
+
+# Remove outliers separately for gmv
+full_data2 <- full_data2 %>%
+  dplyr::group_by(DKT) %>%
+  dplyr::mutate(
+    gmv_no_outliers = remove_outliers_tukey(gmv)$data,
+    gmv_outliers_removed = remove_outliers_tukey(gmv)$outliers
+  ) %>%
+  ungroup()
+# overwrite original aperiodic columns with the outliers removed data
+full_data2$gmv <- full_data2$gmv
+
+# run this for formal statistics
+full_data <- full_data %>% 
+  filter(DKT != "subcortical" & task != "Rest")
+
+```
+
+# Sanity Check: Age x Gray Matter
+
+```{r scatterplots}
+
+# join age data to gmv information
+age_data <- average_df %>% 
+  select(subj, age) %>% 
+  group_by(subj) %>% 
+  summarise(age = mean(age))
+gray_data <- left_join(average_gray_vol, age_data, by = "subj")
+
+# all brain region scatter plots for gmv
+ggplot(gray_data, aes(x = age, y = gmv, color = age)) + 
+  geom_point(shape = 16, size = 5, show.legend = FALSE, alpha = 0.5, 
+             position = position_jitter(width = 0.2)) +
+  xlab("Age [years]") + ylab ("Gray Matter Volume [mm3]") +
+  theme_light() +
+  facet_wrap(~label) +
+  geom_smooth(method = "lm", linetype = "solid", colour = "gray", fill = "NA") +
+  scale_color_viridis_c(option = "magma") +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 7)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5)) +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.2, 'cm'),
+        legend.key.size = unit(0.4, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 10, colour = "black", face = "bold"), 
+        strip.text.x = element_text(size = 14, colour = "black"),
+        strip.text.y = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.line.y.right = element_blank(),
+        axis.line.x.top = element_blank()) +
+  stat_cor(method = "spearman")
+
+# load additional age values
+additional_ages <- read.csv("additional_ages.csv")
+# summarise across all regions
+average_gmv_scatter <- gray_data %>% 
+  dplyr::select(subj, gmv, age, thick) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::group_by(subj) %>% 
+  dplyr::summarise_all(funs(mean), na.rm = FALSE)
+average_gmv_scatter <- average_gmv_scatter %>%
+  left_join(additional_ages, by = "subj") %>%
+  mutate(age = coalesce(age.x, age.y)) %>%
+  select(-age.x, -age.y)
+  
+# remove outliers for gmv
+outlierKD(average_gmv_scatter, gmv)
+
+# plot age x gray matter volume
+ggplot(average_gmv_scatter, aes(x = age, y = gmv, color = age)) + 
+  geom_point(shape = 16, size = 5, show.legend = FALSE, alpha = 0.5, 
+             position = position_jitter(width = 0.2)) +
+  xlab("Age [years]") + ylab ("Gray Matter Volume [mm3]") +
+  theme_light() +
+  geom_smooth(method = "lm", linetype = "solid", colour = "gray", fill = "gray") +
+  scale_color_viridis_c(option = "magma") +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 7)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 7)) +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.2, 'cm'),
+        legend.key.size = unit(0.4, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 16, colour = "black"),
+        legend.title = element_text(size = 16, colour = "black", face = "bold"), 
+        strip.text.x = element_text(size = 18, colour = "black"),
+        strip.text.y = element_text(size = 18, colour = "black"),
+        axis.text = element_text(size = 18),
+        axis.title = element_text(size = 18),
+        plot.title = element_text(size = 16, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.line.y.right = element_blank(),
+        axis.line.x.top = element_blank())
+
+# run linear regression for gmv ~ age
+gmv_lm <- lm(gmv ~ age, data = average_gmv_scatter)
+summary(gmv_lm)
+
+```
+
+# Examine Structure and Function Relationships: Aperiodic Slope
+
+```{r mixed effects models}
+
+# Linear mixed-effects model function for looping over DKT regions
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  model <- lmer(Slope ~ age * gmv + (1 | subj/realID) + (1|task), data = data,
+                control = lmerControl(optimizer = "bobyqa"))
+  emm <- ggemmeans(model, terms = c("age", "gmv"),
+                     ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(full_data$DKT)
+combined_results <- data.frame()  # Create an empty data frame for combined results
+results_df_slope <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- full_data[full_data$DKT == level, ]
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results <- rbind(combined_results, results)
+  
+  # Run lmer model for slope results
+  model <- lmer(Slope ~ age * gmv + (1 | subj/realID) + (1|task), data = subset_data,
+                control = lmerControl(optimizer = "bobyqa"))
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for slope
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Age = fixed_effects[1, "Estimate"],
+    SE_Age = fixed_effects[1, "Std. Error"],
+    PValue_Age = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_GMV = fixed_effects[2, "Estimate"],
+    SE_GMV = fixed_effects[2, "Std. Error"],
+    PValue_GMV = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for slope
+  results_df_slope <- rbind(results_df_slope, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results <- combined_results %>% 
+  rename(Slope = predicted, age = x, gmv = group)
+
+# generate table of all results for aperiodic slope
+slope_table <- results_df_slope %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_GMV = PValue_GMV,
+                P_Interaction = PValue_Interaction)
+
+slope_table_sig <- slope_table %>% 
+  filter(ROI == "inferior frontal" | ROI == "postcentral" | ROI == "posterior cingulate" | ROI == "inferior parietal")
+
+```
+
+# Plot main effects for slope
+
+```{r}
+
+# create data frame for offset age main effects
+slope_main_effect <- full_data %>% 
+  select(subj, DKT, Slope, age, gmv) %>% 
+  group_by(subj, DKT) %>% 
+  dplyr::summarise(Slope = mean(Slope),
+            age = mean(age),
+            gmv = mean(gmv))
+
+# generate the plot for all significant regions for age x slope
+ggplot(slope_main_effect, aes(x = age, y = Slope)) + 
+  geom_point(color = "brown3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  #scale_y_continuous(limits = c(1, 11), breaks = seq(1, 11, by = 2)) +
+  #scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  ylab("Aperiodic Slope") + xlab ("Age [Years]") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold")) +
+  facet_wrap(~DKT)
+
+ggplot(slope_main_effect, aes(x = gmv, y = Slope)) + 
+  geom_point(color = "brown3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  ylab("Aperiodic Slope") + xlab("GMV [mm3]") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold")) +
+  facet_wrap(~DKT, scales = "free_x")
+
+```
+
+# Let's plot the predicted effects for ease of interpretation
+
+```{r predicted effects}
+
+# run model for inferior frontal gyrus
+m1 <- lmer(Slope ~ age * gmv + (1 | subj/realID) + (1|task), data = filter(full_data, DKT == "inferior frontal"),
+                control = lmerControl(optimizer = "bobyqa"))
+# extract model effects
+plot_lmer <- ggemmeans(m1,terms=c("age","gmv [3423.04,4688.43]"), ci.lvl = 0.83) %>% 
+  dplyr::rename(gmv = group)
+plot_lmer$gmv <- factor(plot_lmer$gmv,levels=c("3423.04","4688.43"),
+                             labels=c("Low","High"))
+# plot predicted effects
+ggplot(plot_lmer, aes(x = x, y = predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype = gmv)) +
+  scale_linetype_manual(values = c("solid", "longdash")) +
+  scale_fill_manual(values = c("#101820FF", "#F2AA4CFF")) +
+  geom_ribbon(aes(fill = gmv), alpha = 0.3) +
+  scale_y_continuous(limits = c(1.4, 2.6), breaks = seq(1.4, 2.6, by = .2)) +
+  scale_x_continuous(limits = c(5, 45), breaks = seq(5, 45, by = 5)) +
+  xlab("Age [Years]") + 
+  ylab("Aperiodic Slope") +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    legend.spacing.x = unit(0.1, 'cm'),
+    legend.key.size = unit(0.5, "cm"),
+    legend.background = element_rect(fill = alpha('blue', 0)),
+    legend.text = element_text(size = 10, colour = "black"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(size = 12, colour = "black"),
+    strip.text.y = element_text(size = 12, colour = "black"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 10, face = "bold"),
+    panel.grid = element_blank())
+
+# run model for postcentral gyrus
+m2 <- lmer(Slope ~ age * gmv + (1 | subj/realID) + (1|task), data = filter(full_data, DKT == "postcentral"),
+                control = lmerControl(optimizer = "bobyqa"))
+# extract model effects
+plot_lmer_2 <- ggemmeans(m2,terms=c("age","gmv [8104, 12998]"), ci.lvl = 0.83) %>% 
+  dplyr::rename(gmv = group)
+plot_lmer_2$gmv <- factor(plot_lmer_2$gmv,levels=c("8104","12998"),
+                             labels=c("Low","High"))
+# plot predicted effects
+ggplot(plot_lmer_2, aes(x = x, y = predicted, ymin = conf.low, ymax = conf.high)) +
+  geom_line(aes(linetype = gmv)) +
+  scale_linetype_manual(values = c("solid", "longdash")) +
+  scale_fill_manual(values = c("#101820FF", "#F2AA4CFF")) +
+  geom_ribbon(aes(fill = gmv), alpha = 0.3) +
+  scale_y_continuous(limits = c(0, 3.3), breaks = seq(0, 3.3, by = .5)) +
+  scale_x_continuous(limits = c(5, 50), breaks = seq(5, 50, by = 5)) +
+  xlab("Age [Years]") + 
+  ylab("Aperiodic Slope") +
+  theme_classic() +
+  theme(
+    legend.position = "top",
+    legend.spacing.x = unit(0.1, 'cm'),
+    legend.key.size = unit(0.5, "cm"),
+    legend.background = element_rect(fill = alpha('blue', 0)),
+    legend.text = element_text(size = 10, colour = "black"),
+    legend.title = element_blank(),
+    strip.text.x = element_text(size = 12, colour = "black"),
+    strip.text.y = element_text(size = 12, colour = "black"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 10, face = "bold"),
+    panel.grid = element_blank())
+
+```
+
+# Plot significant interaction between GMV and age on slope
+
+```{r plot significant regions age x gmv}
+
+plot_data_pcc <- full_data %>% 
+  ungroup() %>% 
+  select(subj, DKT, Slope, age, gmv, task, Offset, sex) %>% 
+  filter(DKT == "posterior cingulate" | DKT == "postcentral" |
+         DKT == "inferior frontal" | DKT == "inferior parietal") %>% 
+  group_by(subj, DKT, task, sex) %>% 
+  summarise_all(funs(mean), na.rm = FALSE)
+
+# Plot interaction for posterior cingulate
+ggplot(filter(na.omit(plot_data_pcc), DKT == "posterior cingulate"), aes(x=age, y=Slope, color = gmv)) + 
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "GMV [mm3]") +
+  labs(x="Age [years]", y = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# Plot interaction for postcentral gyrus
+ggplot(filter(na.omit(plot_data_pcc), DKT == "postcentral"), aes(x=age, y=Slope, color = gmv)) +
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "GMV [mm3]") +
+  labs(x="Age [years]", y = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# Plot interaction for superior temporal
+ggplot(filter(na.omit(plot_data_pcc), DKT == "inferior frontal"), aes(x=age, y=Slope, color = gmv)) + 
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "GMV [mm3]") +
+  labs(x="Age [years]", y = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# Plot interaction for inferior parietal
+ggplot(filter(na.omit(plot_data_pcc), DKT == "inferior parietal"), aes(x=age, y=Slope, color = gmv)) + 
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "GMV [mm3]") +
+  labs(x="Age [years]", y = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
+
+# Plot significant slope regions
+
+```{r slope regions}
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("lateral occipital",         # 1
+                         "lateral occipital",         # 2
+                         "parahippocampal",           # 3
+                         "posterior cingulate",       # 4
+                         "precentral",                # 5
+                         "inferior frontal",          # 6
+                         "inferior frontal",          # 7
+                         "inferior frontal",          # 8
+                         "lateral occipital",         # 9
+                         "superior parietal",         # 10
+                         "superior parietal",         # 11
+                         "temporal pole",             # 12
+                         "superior temporal",         # 13
+                         "caudal middle frontal",     # 14
+                         "caudal anterior cingulate") # 15
+
+new_labels <- c("lingual",                            # 1
+                "cuneus",                             # 2
+                "entorhinal",                         # 3
+                "isthmus cingulate",                  # 4
+                "paracentral",                        # 5
+                "pars opercularis",                   # 6
+                "pars triangularis",                  # 7
+                "pars orbitalis",                     # 8
+                "pericalcarine",                      # 9
+                "precuneus",                          # 10
+                "supramarginal",                      # 11
+                "middle temporal",                    # 12
+                "transverse temporal",                # 13
+                "superior frontal",                   # 14
+                "rostral anterior cingulate")         # 15
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Duplicate the entire data frame
+df_duplicated_slope <- bind_rows(replicate(3, results_df_slope, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_slope <- df_duplicated_slope %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_slope <- bind_rows(df_duplicated_slope, results_df_slope)
+df_final_slope <- distinct(df_final_slope)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+slope_tibble <- tibble(df_final_slope) %>%
+  select(DKT, PValue_Interaction, Estimate_Interaction) %>% 
+  filter(DKT != "inferior frontal" & DKT != "temporal pole" & DKT != "subcortical") %>%
+  rename(region = DKT, p = PValue_Interaction, B = Estimate_Interaction)
+
+ggplot(slope_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = B, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  scale_fill_viridis_c(option = "magma") +  # Use inferno palette
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Cortical Slope and GMV
+
+```{r Generate cortical plot for slope and gmv}
+
+# create data frame
+cor_df <- full_data2 %>%
+  ungroup() %>% 
+  select(subj, gmv, Slope, Offset, DKT, task, DKT) %>% 
+  group_by(subj, task, DKT) %>% 
+  summarise_all(funs(mean), na.rm = FALSE)
+
+# Initialize an empty data frame to store results
+cor_results <- data.frame(DKT = character(), Correlation = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+
+# Define a function to calculate correlation for each DKT level
+correlation_by_DKT <- function(DKT_level) {
+  # Subset data for the specific DKT level
+  subset_df <- cor_df %>% filter(DKT == DKT_level)
+  
+  # Calculate correlation between Slope and gmv
+  cor_test_result <- cor.test(subset_df$Slope, subset_df$gmv)
+  
+  # Extract correlation coefficient and p-value
+  correlation <- cor_test_result$estimate
+  p_value <- cor_test_result$p.value
+  
+  # Create a data frame with the results
+  result_df <- data.frame(DKT = DKT_level, Correlation = correlation, p_value = p_value)
+  
+  return(result_df)
+}
+
+# Loop over each level of DKT and calculate correlation
+cor_results <- map_df(unique(cor_df$DKT), correlation_by_DKT)
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("lateral occipital",         # 1
+                         "lateral occipital",         # 2
+                         "parahippocampal",           # 3
+                         "posterior cingulate",       # 4
+                         "precentral",                # 5
+                         "inferior frontal",          # 6
+                         "inferior frontal",          # 7
+                         "inferior frontal",          # 8
+                         "lateral occipital",         # 9
+                         "superior parietal",         # 10
+                         "superior parietal",         # 11
+                         "temporal pole",             # 12
+                         "superior temporal",         # 13
+                         "caudal middle frontal",     # 14
+                         "caudal anterior cingulate") # 15
+
+new_labels <- c("lingual",                            # 1
+                "cuneus",                             # 2
+                "entorhinal",                         # 3
+                "isthmus cingulate",                  # 4
+                "paracentral",                        # 5
+                "pars opercularis",                   # 6
+                "pars triangularis",                  # 7
+                "pars orbitalis",                     # 8
+                "pericalcarine",                      # 9
+                "precuneus",                          # 10
+                "supramarginal",                      # 11
+                "middle temporal",                    # 12
+                "transverse temporal",                # 13
+                "superior frontal",                   # 14
+                "rostral anterior cingulate")         # 15
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Duplicate the entire data frame
+df_duplicated_cor <- bind_rows(replicate(3, cor_results, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_cor <- df_duplicated_cor %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_cor <- bind_rows(df_duplicated_cor, cor_results)
+df_final_cor <- distinct(df_final_cor) %>% 
+  rename(region = DKT)
+
+lower_limit <- -0.30
+upper_limit <- 0.28
+num_ticks <- 6
+ticks <- pretty(c(lower_limit, upper_limit), n = num_ticks)
+
+ggplot(df_final_cor) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = Correlation, color = "transparent")) +
+  scale_fill_viridis_c(option = "magma", limits = c(lower_limit, upper_limit), breaks = ticks) + 
+  scale_color_manual(values = "transparent") +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Cortical Offset and GMV
+
+```{r Generate cortical plot for offset and gmv}
+
+# Initialize an empty data frame to store results
+cor_results_offset <- data.frame(DKT = character(), Correlation = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+
+# Define a function to calculate correlation for each DKT level
+correlation_by_DKT <- function(DKT_level) {
+  # Subset data for the specific DKT level
+  subset_df <- cor_df %>% filter(DKT == DKT_level)
+  
+  # Calculate correlation between Slope and gmv
+  cor_test_result_offset <- cor.test(subset_df$Offset, subset_df$gmv)
+  
+  # Extract correlation coefficient and p-value
+  correlation <- cor_test_result_offset$estimate
+  p_value <- cor_test_result_offset$p.value
+  
+  # Create a data frame with the results
+  result_df_offset <- data.frame(DKT = DKT_level, Correlation = correlation, p_value = p_value)
+  
+  return(result_df_offset)
+}
+
+# Loop over each level of DKT and calculate correlation
+cor_results_offset <- map_df(unique(cor_df$DKT), correlation_by_DKT)
+
+# Duplicate the entire data frame
+df_duplicated_cor_offset <- bind_rows(replicate(3, cor_results_offset, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_cor_offset <- df_duplicated_cor_offset %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_cor_offset <- bind_rows(df_duplicated_cor_offset, cor_results_offset)
+df_final_cor_offset <- distinct(df_final_cor_offset) %>% 
+  rename(region = DKT)
+
+lower_limit <- -0.30
+upper_limit <- 0.36
+num_ticks <- 6
+ticks <- pretty(c(lower_limit, upper_limit), n = num_ticks)
+
+ggplot(df_final_cor_offset) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = Correlation, color = "transparent")) +
+  scale_fill_viridis_c(option = "magma", limits = c(lower_limit, upper_limit), breaks = ticks) + 
+  scale_color_manual(values = "transparent") +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Generate scatterplots for the slope x gmv analysis
+
+```{r scatterplots gmv x aperiodic}
+
+gmv_aperiodic <- full_data2 %>%
+  ungroup() %>% 
+  select(subj, gmv, Slope, Offset, DKT, task, DKT, age) %>% 
+  group_by(subj, task, DKT) %>% 
+  summarise_all(funs(mean), na.rm = FALSE)
+
+# slope rostral middle frontal
+rmf_filt <- gmv_aperiodic %>% 
+  filter(DKT == "rostral middle frontal")
+cor.test(rmf_filt$Slope, rmf_filt$gmv, method = "pearson")
+
+ggplot(rmf_filt, aes(x = gmv, y = Slope)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#c41e3a") +
+  geom_smooth(method = "lm", color = "#c41e3a", fill = "#c41e3a") +
+  scale_y_continuous(limits = c(1.5, 3), breaks = seq(1.5, 3, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Slope") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# slope inferior temporal
+it_filt <- gmv_aperiodic %>% 
+  filter(DKT == "inferior temporal")
+cor.test(it_filt$Slope, it_filt$gmv, method = "pearson")
+
+ggplot(it_filt, aes(x = gmv, y = Slope)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#c41e3a") +
+  geom_smooth(method = "lm", color = "#c41e3a", fill = "#c41e3a") +
+  scale_y_continuous(limits = c(1.5, 3), breaks = seq(1.5, 3, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Slope") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
+
+# GMV x offset scatterplots
+
+```{r gmv offset}
+
+# offset lateral orbitofrontal
+lof_filt_offset <- gmv_aperiodic %>% 
+  filter(DKT == "lateral orbitofrontal")
+cor.test(lof_filt_offset$Offset, lof_filt_offset$gmv, method = "pearson")
+
+ggplot(lof_filt_offset, aes(x = gmv, y = Offset)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#38618c") +
+  geom_smooth(method = "lm", color = "#38618c", fill = "#38618c") +
+  scale_y_continuous(limits = c(2, 12), breaks = seq(2, 12, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Offset") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# offset rostral middle frontal
+rmf_filt_offset <- gmv_aperiodic %>% 
+  filter(DKT == "rostral middle frontal")
+cor.test(rmf_filt_offset$Offset, rmf_filt_offset$gmv, method = "pearson")
+
+ggplot(rmf_filt_offset, aes(x = gmv, y = Offset)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#38618c") +
+  geom_smooth(method = "lm", color = "#38618c", fill = "#38618c") +
+  scale_y_continuous(limits = c(2, 12), breaks = seq(2, 12, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Offset") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# offset caudal middle frontal
+cmf_filt_offset <- gmv_aperiodic %>% 
+  filter(DKT == "caudal middle frontal")
+cor.test(cmf_filt_offset$Offset, cmf_filt_offset$gmv, method = "pearson")
+
+ggplot(cmf_filt_offset, aes(x = gmv, y = Offset)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#38618c") +
+  geom_smooth(method = "lm", color = "#38618c", fill = "#38618c") +
+  scale_y_continuous(limits = c(2, 12), breaks = seq(2, 12, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Offset") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# offset superior temporal
+sp_filt_offset <- gmv_aperiodic %>% 
+  filter(DKT == "superior temporal")
+cor.test(sp_filt_offset$Offset, sp_filt_offset$gmv, method = "pearson")
+
+ggplot(sp_filt_offset, aes(x = gmv, y = Offset)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#38618c") +
+  geom_smooth(method = "lm", color = "#38618c", fill = "#38618c") +
+  scale_y_continuous(limits = c(2, 12), breaks = seq(2, 12, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Offset") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# offset inferior temporal
+it_filt_offset <- gmv_aperiodic %>% 
+  filter(DKT == "inferior temporal")
+cor.test(it_filt_offset$Offset, it_filt_offset$gmv, method = "pearson")
+
+ggplot(it_filt_offset, aes(x = gmv, y = Offset)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .4, color = "#38618c") +
+  geom_smooth(method = "lm", color = "#38618c", fill = "#38618c") +
+  scale_y_continuous(limits = c(2, 12), breaks = seq(2, 12, length.out = 6)) +
+  theme_classic() +
+  labs(x = "Gray Matter Volume [mm3]", y = "Aperiodic Offset") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
+
+# Age by Gray Matter Volume Effects
+
+```{r}
+
+# Create data frame for analysis
+average_gmv_mod <- full_data2 %>% 
+  ungroup() %>% 
+  select(subj, DKT, gmv, age) %>% 
+  group_by(subj, DKT) %>% 
+  summarise_all(funs(mean), na.rm = TRUE)
+
+# Join additional subjects
+additional_ages <- read.csv("additional_ages.csv")
+average_gmv_mod <- average_gmv_mod %>%
+  left_join(additional_ages, by = "subj") %>%
+  mutate(age = coalesce(age.x, age.y)) %>%
+  select(-age.x, -age.y)
+
+# Run mixed-effects model for age
+roi_model <- lmer(gmv ~ DKT * age + (1 | subj), data = average_gmv_mod, 
+                  control = lmerControl(optimizer = "bobyqa"))
+Anova(roi_model)
+
+desired_order <- rev(c("caudal anterior cingulate",
+                       "inferior frontal",
+                       "lateral orbitofrontal",
+                       "medial orbitofrontal",
+                       "caudal middle frontal",
+                       "rostral middle frontal",
+                       "precentral",
+                       "postcentral",
+                       "insula",
+                       "subcortical",
+                       "inferior parietal",
+                       "superior parietal",
+                       "inferior temporal",
+                       "middle temporal",
+                       "superior temporal",
+                       "temporal pole",
+                       "fusiform",
+                       "parahippocampal",
+                       "posterior cingulate",
+                       "lateral occipital"
+                      ))
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("lateral occipital",         # 1
+                         "lateral occipital",         # 2
+                         "parahippocampal",           # 3
+                         "posterior cingulate",       # 4
+                         "precentral",                # 5
+                         "inferior frontal",          # 6
+                         "inferior frontal",          # 7
+                         "inferior frontal",          # 8
+                         "lateral occipital",         # 9
+                         "superior parietal",         # 10
+                         "superior parietal",         # 11
+                         "temporal pole",             # 12
+                         "superior temporal",         # 13
+                         "caudal middle frontal",     # 14
+                         "caudal anterior cingulate") # 15
+
+new_labels <- c("lingual",                            # 1
+                "cuneus",                             # 2
+                "entorhinal",                         # 3
+                "isthmus cingulate",                  # 4
+                "paracentral",                        # 5
+                "pars opercularis",                   # 6
+                "pars triangularis",                  # 7
+                "pars orbitalis",                     # 8
+                "pericalcarine",                      # 9
+                "precuneus",                          # 10
+                "supramarginal",                      # 11
+                "middle temporal",                    # 12
+                "transverse temporal",                # 13
+                "superior frontal",                   # 14
+                "rostral anterior cingulate")         # 15
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Initialize an empty data frame to store results
+cor_results_age <- data.frame(DKT = character(), Correlation = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+
+# Define a function to calculate correlation for each DKT level
+correlation_by_DKT <- function(DKT_level) {
+  # Subset data for the specific DKT level
+  subset_df <- average_gmv_mod %>% filter(DKT == DKT_level)
+  
+  # Calculate correlation between Slope and gmv
+  cor_test_result_age <- cor.test(subset_df$gmv, subset_df$age)
+  
+  # Extract correlation coefficient and p-value
+  correlation <- cor_test_result_age$estimate
+  p_value <- cor_test_result_age$p.value
+  
+  # Create a data frame with the results
+  result_df_age <- data.frame(DKT = DKT_level, Correlation = correlation, p_value = p_value)
+  
+  return(result_df_age)
+}
+
+# Loop over each level of DKT and calculate correlation
+cor_results_age <- map_df(unique(average_gmv_mod$DKT), correlation_by_DKT)
+
+# Duplicate the entire data frame
+df_duplicated_cor_age <- bind_rows(replicate(3, cor_results_age, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_cor_age <- df_duplicated_cor_age %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_cor_age <- bind_rows(df_duplicated_cor_age, cor_results_age)
+df_final_cor_age <- distinct(df_final_cor_age) %>% 
+  rename(region = DKT)
+
+# convert p values to real numbers
+options(scipen = 999)  # Disable scientific notation globally
+df_final_cor_age$p_value <- format(df_final_cor_age$p_value, scientific = FALSE)
+
+lower_limit <- -0.61
+upper_limit <- 0.05
+num_ticks <- 6
+ticks <- pretty(c(lower_limit, upper_limit), n = num_ticks)
+
+# plot on cortex
+ggplot(df_final_cor_age) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = Correlation, color = "transparent")) +
+  scale_fill_viridis_c(option = "magma", limits = c(lower_limit, upper_limit), breaks = ticks) + 
+  scale_color_manual(values = "transparent") +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+# lateral orbitofrontal cortex
+average_gmv_lof <- average_gmv_mod %>% 
+  filter(DKT == "lateral orbitofrontal")
+cor.test(average_gmv_lof$gmv, average_gmv_lof$age, method = "pearson")
+lofc <- ggplot(average_gmv_lof, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# medial orbitofrontal cortex
+average_gmv_mof <- average_gmv_mod %>% 
+  filter(DKT == "medial orbitofrontal")
+cor.test(average_gmv_mof$gmv, average_gmv_mof$age, method = "pearson")
+mofc <- ggplot(average_gmv_mof, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# rostral middle frontal gyrus
+average_gmv_rmf <- average_gmv_mod %>% 
+  filter(DKT == "rostral middle frontal")
+cor.test(average_gmv_rmf$gmv, average_gmv_rmf$age, method = "pearson")
+rmfg <- ggplot(average_gmv_rmf, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# caudal middle frontal gyrus
+average_gmv_cmf <- average_gmv_mod %>% 
+  filter(DKT == "caudal middle frontal")
+cor.test(average_gmv_cmf$gmv, average_gmv_cmf$age, method = "pearson")
+cmfg <- ggplot(average_gmv_cmf, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# inferior frontal gyrus
+average_gmv_ifg <- average_gmv_mod %>% 
+  filter(DKT == "inferior frontal")
+cor.test(average_gmv_ifg$gmv, average_gmv_ifg$age, method = "pearson")
+ifg <- ggplot(average_gmv_ifg, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# superior temporal cortex
+average_gmv_spc <- average_gmv_mod %>% 
+  filter(DKT == "superior temporal")
+cor.test(average_gmv_spc$gmv, average_gmv_spc$age, method = "pearson")
+sptc <- ggplot(average_gmv_spc, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# middle temporal cortex
+average_gmv_mpc <- average_gmv_mod %>% 
+  filter(DKT == "middle temporal")
+cor.test(average_gmv_mpc$gmv, average_gmv_mpc$age, method = "pearson")
+mtc <- ggplot(average_gmv_mpc, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# posterior cingulate cortex
+average_gmv_pcc <- average_gmv_mod %>% 
+  filter(DKT == "posterior cingulate")
+cor.test(average_gmv_pcc$gmv, average_gmv_pcc$age, method = "pearson")
+pcc <- ggplot(average_gmv_pcc, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# inferior parietal cortex
+average_gmv_ipc <- average_gmv_mod %>% 
+  filter(DKT == "inferior parietal")
+cor.test(average_gmv_ipc$gmv, average_gmv_ipc$age, method = "pearson")
+ipc <- ggplot(average_gmv_ipc, aes(x = age, y = gmv)) +
+  geom_point(shape = 16, size = 3, show.legend = FALSE, alpha = .5, color = "#c77cff") +
+  geom_smooth(method = "lm", color = "#c77cff", fill = "#c77cff", alpha = .2) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  theme_classic() +
+  labs(y = "Gray Matter Volume [mm3]", x = "Age [years]") +
+  theme(legend.position = "right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, color = "black"),
+        legend.title = element_text(size = 12, color = "black"),
+        strip.text.x = element_text(size = 12, color = "black"),
+        strip.text.y = element_text(size = 12, color = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# Join plots together
+ggarrange(lofc, mofc, rmfg, cmfg, ifg, sptc, mtc, pcc, ipc, nrow = 3, ncol = 3, common.legend = T)
+
+```

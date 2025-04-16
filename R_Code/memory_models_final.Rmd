@@ -1,0 +1,964 @@
+---
+title: "Modelling memory and aperiodic activity"
+author: "Zachariah R Cross"
+date: "2023-11-01"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Load packages
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# load packages
+library(tidyverse)
+library(Rmisc)
+library(RColorBrewer)
+library(hrbrthemes)
+library(sjmisc)
+library(sjlabelled)
+library(lme4)
+library(lmerOut)
+library(lmerTest)
+library(car)
+library(splines)
+library(ggeffects)
+library(performance)
+library(ggpubr)
+library(rempsyc)
+library(ggExtra)
+library(broom)
+library(plotly)
+library(emmeans)
+library(purrr)
+library(ggseg)
+library(ggsegDKT)
+
+# set contrasts
+options(contrasts=c("contr.Sum","contr.Helmert"))
+options(decorate.contr.Sum="",decorate.contrasts=c("[","]"))
+
+# functioning for modifying tick labels
+number_ticks <- function(n) {function(limits) pretty(limits, n)}
+
+# set jitter width
+pd_2 <- position_dodge(width = .5)
+
+```
+
+# Outlier detection and raincloud plot function
+
+```{r outlier detection function}
+
+# outlier detection function
+outlierKD <- function(dt, var) {
+  var_name <- eval(substitute(var),eval(dt))
+  tot <- sum(!is.na(var_name))
+  na1 <- sum(is.na(var_name))
+  m1 <- mean(var_name, na.rm = T)
+  par(mfrow=c(2, 2), oma=c(0,0,3,0))
+  boxplot(var_name, main="With outliers")
+  hist(var_name, main="With outliers", xlab=NA, ylab=NA)
+  outlier <- boxplot.stats(var_name)$out
+  mo <- mean(outlier)
+  var_name <- ifelse(var_name %in% outlier, NA, var_name)
+  boxplot(var_name, main="Without outliers")
+  hist(var_name, main="Without outliers", xlab=NA, ylab=NA)
+  title("Outlier Check", outer=TRUE)
+  na2 <- sum(is.na(var_name))
+  message("Outliers identified: ", na2 - na1, " from ", tot, " observations")
+  message("Proportion (%) of outliers: ", (na2 - na1) / tot*100)
+  message("Mean of the outliers: ", mo)
+  m2 <- mean(var_name, na.rm = T)
+  message("Mean without removing outliers: ", m1)
+  message("Mean if we remove outliers: ", m2)
+  response <- readline(prompt="Do you want to remove outliers and to replace with NA? [yes/no]: ")
+  if(response == "y" | response == "yes"){
+    dt[as.character(substitute(var))] <- invisible(var_name)
+    assign(as.character(as.list(match.call())$dt), dt, envir = .GlobalEnv)
+    message("Outliers successfully removed", "\n")
+    return(invisible(dt))
+  } else{
+    message("Nothing changed", "\n")
+    return(invisible(var_name))
+  }
+}
+
+# Defining the geom_flat_violin function ----
+# Note: the below code modifies the
+# existing github page by removing a parenthesis in line 50
+"%||%" <- function(a, b) {
+  if (!is.null(a)) a else b
+}
+geom_flat_violin <- function(mapping = NULL, data = NULL, stat = "ydensity",
+                             position = "dodge", trim = TRUE, scale = "area",
+                             show.legend = NA, inherit.aes = TRUE, ...) {
+  layer(
+    data = data,
+    mapping = mapping,
+    stat = stat,
+    geom = GeomFlatViolin,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(
+      trim = trim,
+      scale = scale,
+      ...
+    )
+  )
+}
+#' @rdname ggplot2-ggproto
+#' @format NULL
+#' @usage NULL
+#' @export
+GeomFlatViolin <-
+  ggproto("GeomFlatViolin", Geom,
+          setup_data = function(data, params) {
+            data$width <- data$width %||%
+              params$width %||% (resolution(data$x, FALSE) * 0.9)
+            # ymin, ymax, xmin, and xmax define the bounding rectangle for each group
+            data %>%
+              group_by(group) %>%
+              mutate(
+                ymin = min(y),
+                ymax = max(y),
+                xmin = x,
+                xmax = x + width / 2
+              )
+          },
+          draw_group = function(data, panel_scales, coord) {
+            # Find the points for the line to go all the way around
+            data <- transform(data,
+                              xminv = x,
+                              xmaxv = x + violinwidth * (xmax - x)
+            )
+            # Make sure it's sorted properly to draw the outline
+            newdata <- rbind(
+              plyr::arrange(transform(data, x = xminv), y),
+              plyr::arrange(transform(data, x = xmaxv), -y)
+            )
+            # Close the polygon: set first and last point the same
+            # Needed for coord_polar and such
+            newdata <- rbind(newdata, newdata[1, ])
+            ggplot2:::ggname("geom_flat_violin", GeomPolygon$draw_panel(newdata, panel_scales, coord))
+          },
+          draw_key = draw_key_polygon,
+          default_aes = aes(
+            weight = 1, colour = "grey20", fill = "white", size = 0.5,
+            alpha = NA, linetype = "solid"
+          ),
+          required_aes = c("x", "y")
+  )
+
+```
+
+## Read in data frames
+## read in both the aperiodic and memory data frames and join them
+
+```{r load data}
+
+# load in main data frame
+df <- read.csv("aperiodic_final_updated.csv", header = T)
+
+average_df_subj <- df %>% 
+  filter(condition == "Rest")
+heh <- as.data.frame(unique(average_df_subj$subj))
+
+# load in memory data
+memory_data <- read.csv("memory_performance.csv")
+
+# join memory performance to aperiodic data frame
+df <- left_join(df, memory_data, by = c("subj","task"))
+
+patient_data <- df %>%  
+  select(subj, memory, age, task, condition) %>% 
+  filter(condition == "Task") %>% 
+  group_by(subj, task, condition) %>% 
+  summarise(memory = mean(memory),
+            age = mean(age)) %>% 
+  ungroup() %>% 
+    select(-task, -condition) %>% 
+  na.omit()
+patient_data$condition <- "pt"
+
+# ensure our factors are indeed factors
+patient_data$subj <- as.factor(patient_data$subj)
+patient_data$condition <- as.factor(patient_data$condition)
+
+# lets get the mean and standard deviation of performance
+descriptive_memory <- patient_data %>% 
+  summarise(average = mean(memory),
+            sd = sd(memory))
+
+# also grab the range
+summary(patient_data$memory)
+
+```
+
+# generate memory performance plot
+
+```{r memory performance}
+
+# load in the control data
+control_data <- read.csv("memory_behav_controls.csv")
+
+# ensure our factors are indeed factors
+control_data$subj <- as.factor(control_data$subj)
+control_data$condition <- as.factor(control_data$condition)
+
+# join the two data frames together
+behav_plot_df <- rbind(patient_data, control_data) %>% 
+  filter(memory > 0)
+
+# re-label group levels
+behav_plot_df$condition <- factor(behav_plot_df$condition,levels=c("ctrl","pt"),
+                              labels=c("Control","Patient"))
+
+# let's get the list of the participants in which we have memory performance
+subj_list <- as.data.frame(unique(patient_data$subj))
+
+# run linear regression with two cubic splines for patient data only
+mem.age <- lm(memory ~ ns(age,2), data = filter(behav_plot_df, condition == "Patient"))
+summary(mem.age)
+
+# run mixed model comparing memory against zero
+m1. <- lmer(memory ~ 1 + (1 | subj), data = filter(behav_plot_df, condition == "Patient"),
+             control = lmerControl(optimizer = "bobyqa"))
+summary(m1.)
+
+# plot the results
+mem.age.df <- ggemmeans(mem.age,
+                     terms = c("age [all]"),
+                     ci.lvl = 0.83) %>% 
+  dplyr::rename(age = x, memory = predicted, condition = group)
+
+ggplot(mem.age.df, aes(age, memory)) +
+  geom_path(aes(colour = condition)) +
+  scale_linetype_manual(values=c("solid", "longdash", "solid")) +
+  scale_fill_manual(values = c('turquoise4', 'turquoise4', 'turquoise4')) +
+  geom_ribbon(aes(fill = condition, ymin = conf.low, ymax = conf.high), alpha = 0.3) +
+  scale_x_continuous(limits = c(5, 55), breaks = seq(5, 55, by = 10)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 6)) +
+  labs(y="Recognition Accuracy", x = "Age") +
+    geom_hline(yintercept=0, linetype="solid", 
+                color = "grey", size=0.5) +
+  scale_shape_manual(values=c(1,19,1))+
+  scale_color_manual(values=c('#101820FF','grey','turquoise4'))+
+  geom_point(aes(shape=condition, color=condition, fill=condition), alpha = 0.6, 
+             size = 3, data = behav_plot_df) +
+  theme_classic() +  
+  theme(legend.position="none",
+        axis.title.x = element_text(size=16),
+        plot.title = element_text(size=14, face="bold"),
+        axis.title.y = element_text(size=16),
+        axis.text.x = element_text(size=16),
+        axis.text.y = element_text(size=16),
+        strip.text.x = element_text(size = 17),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+```
+
+# Prepare data frame for analysis
+## filter data frames and create resting EEG data frame with memory performance
+## also remove outliers
+
+```{r data frame aperiodic}
+
+# average over epochs and filter channels with a model fit of >.90
+average_df <- df %>% 
+  dplyr::select(subj, age, task, Slope, R.2, DKT,
+                Offset, memory) %>%
+  filter(task != "Rest") %>% 
+  group_by(subj, task, DKT) %>%
+  dplyr::summarise(Slope = mean(Slope),
+                   Offset = mean(Offset),
+            age = mean(age),
+            R.2 = mean(R.2),
+            memory = mean(memory)) %>% 
+  na.omit()
+
+# factorise variables
+average_df$subj <- factor(average_df$subj)
+average_df$task <- factor(average_df$task)
+average_df$DKT <- factor(average_df$DKT)
+
+# create data frame to isolate resting-state
+resting_state_df <- df %>% 
+  dplyr::select(subj, age, condition, Slope, R.2, DKT, Offset, task) %>%
+  filter(task == "Rest" & condition != "Task") %>% 
+  group_by(subj, condition, DKT, task) %>%
+  dplyr::summarise(Slope = mean(Slope),
+                   Offset = mean(Offset),
+            age = mean(age),
+            R.2 = mean(R.2)) %>% 
+  na.omit()
+
+# same as above
+memory_df <- average_df %>% 
+  select(subj, memory, age) %>% 
+  group_by(subj) %>% 
+  summarise(memory = mean(memory),
+            age = mean(age))
+
+# join memory performance to resting-state slope
+memory_rest <- left_join(memory_df, resting_state_df, 
+                         by = c("subj", "age")) %>% 
+  select(-condition, -R.2) %>% 
+  na.omit()
+memory_rest$subj <- as.factor(memory_rest$subj)
+memory_rest$DKT <- as.factor(memory_rest$DKT)
+
+overall_memory <- average_df %>% 
+  select(subj, age, memory, task) %>% 
+  group_by(subj, task) %>% 
+  dplyr::summarise(memory = mean(memory),
+            age = mean(age))
+
+mean_memory <- mean(overall_memory$memory)
+sd_memory <- sd(overall_memory$memory)
+
+# run model to examine memory performance
+mem_model <- lm(memory ~ age,
+                  data = overall_memory)
+summary(mem_model)
+
+# remove outliers for slope and offset
+# task-related data
+outlierKD(average_df, Offset)
+outlierKD(average_df, Slope)
+# resting-state data
+outlierKD(memory_rest, Offset)
+outlierKD(memory_rest, Slope)
+
+```
+
+## Run regression models and extract predicted effects for slope
+## loop over each DKT region for task-related aperiodic slope and save results
+
+```{r lmer loop through each ROI}
+
+# Linear mixed-effects model function for looping over DKT regions
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  model <- lm(memory ~ Slope * age, data = data)
+  emm <- ggemmeans(model, terms = c("Slope", "age"),
+                     ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(average_df$DKT)
+combined_results <- data.frame()  # Create an empty data frame for combined results
+results_df_slope <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- average_df[average_df$DKT == level, ]
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results <- rbind(combined_results, results)
+  
+  # Run lmer model for slope results
+  model <- lm(memory ~ Slope * age, data = subset_data)
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for slope
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Slope = fixed_effects[1, "Estimate"],
+    SE_Slope = fixed_effects[1, "Std. Error"],
+    PValue_Slope = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_Age = fixed_effects[2, "Estimate"],
+    SE_Age = fixed_effects[2, "Std. Error"],
+    PValue_Age = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for slope
+  results_df_slope <- rbind(results_df_slope, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results <- combined_results %>% 
+  rename(memory = predicted, Slope = x, age = group)
+
+# generate table of all results for aperiodic slope
+slope_table <- results_df_slope %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_Slope = PValue_Slope,
+                P_Interaction = PValue_Interaction)
+
+```
+
+# Plot main effect of slope
+
+```{r plot slope}
+
+ggplot(average_df, aes(x = Slope, y = memory)) + 
+  geom_point(color = "brown3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  facet_wrap(~DKT) +
+  scale_color_viridis_c(option = "magma") +
+  xlab("Aperiodic Slope") + ylab ("Recognition Accuracy") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
+
+## Run mixed-effects models and extract predicted effects for offset
+## loop over each DKT region for task-related aperiodic offset and save results
+
+```{r lmer loop through each ROI}
+
+# Linear mixed-effects model function for looping over DKT regions
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  model <- lm(memory ~ Offset * age, data = data)
+  emm <- ggemmeans(model, terms = c("Offset", "age"),
+                     ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(average_df$DKT)
+combined_results_offset <- data.frame()  # Create an empty data frame for combined results
+results_df_offset <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- average_df[average_df$DKT == level, ]
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results_offset <- rbind(combined_results_offset, results)
+  
+  # Run lmer model for slope results
+  model <- lm(memory ~ Offset * age, data = subset_data)
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for slope
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Offset = fixed_effects[1, "Estimate"],
+    SE_Offset = fixed_effects[1, "Std. Error"],
+    PValue_Offset = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_Age = fixed_effects[2, "Estimate"],
+    SE_Age = fixed_effects[2, "Std. Error"],
+    PValue_Age = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for slope
+  results_df_offset <- rbind(results_df_offset, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results_offset <- combined_results_offset %>% 
+  rename(memory = predicted, Offset = x, age = group)
+
+# generate table of all results for aperiodic slope
+offset_table <- results_df_offset %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_Offset = PValue_Offset,
+                P_Interaction = PValue_Interaction)
+
+```
+
+# Plot main effect of offset
+
+```{r plot offset}
+
+ggplot(average_df, aes(x = Offset, y = memory)) + 
+  geom_point(color = "dodgerblue3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  facet_wrap(~DKT) +
+  scale_color_viridis_c(option = "magma") +
+  xlab("Aperiodic Offset") + ylab ("Recognition Accuracy") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold")) 
+
+```
+
+# DKT cortical atlas plots
+## relabel our regions to match the ggseg DKT atlas plots
+## do this for both the aperiodic slope and offset
+
+```{r prepare cortical atlas}
+
+# Load the DKT atlas data
+data("dkt")
+regions <- dkt[["data"]][["region"]]
+regions <- as.data.frame(regions)
+regions <- unique(regions)
+
+# Specify the levels of DKT to duplicate and their corresponding new labels
+levels_to_duplicate <- c("lateral occipital",         # 1
+                         "lateral occipital",         # 2
+                         "parahippocampal",           # 3
+                         "posterior cingulate",       # 4
+                         "precentral",                # 5
+                         "inferior frontal",          # 6
+                         "inferior frontal",          # 7
+                         "inferior frontal",          # 8
+                         "lateral occipital",         # 9
+                         "superior parietal",         # 10
+                         "superior parietal",         # 11
+                         "temporal pole",             # 12
+                         "superior temporal",         # 13
+                         "caudal middle frontal",     # 14
+                         "caudal anterior cingulate", # 15
+                         "hippocampus",               # 16
+                         "amygdala")                  # 17
+
+new_labels <- c("lingual",                            # 1
+                "cuneus",                             # 2
+                "entorhinal",                         # 3
+                "isthmus cingulate",                  # 4
+                "paracentral",                        # 5
+                "pars opercularis",                   # 6
+                "pars triangularis",                  # 7
+                "pars orbitalis",                     # 8
+                "pericalcarine",                      # 9
+                "precuneus",                          # 10
+                "supramarginal",                      # 11
+                "middle temporal",                    # 12
+                "transverse temporal",                # 13
+                "superior frontal",                   # 14
+                "rostral anterior cingulate",         # 15
+                "entorhinal",                         # 16
+                "entorhinal")                         # 17
+
+# Create a data frame with levels to duplicate and their corresponding new labels
+df_labels <- tibble(DKT = levels_to_duplicate, new_label = new_labels)
+
+# Duplicate the entire data frame
+df_duplicated_slope <- bind_rows(replicate(3, results_df_slope, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_slope <- df_duplicated_slope %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_slope <- bind_rows(df_duplicated_slope, results_df_slope)
+df_final_slope <- distinct(df_final_slope)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+slope_tibble <- tibble(df_final_slope) %>%
+  select(DKT, PValue_Interaction, Estimate_Interaction) %>% 
+  filter(DKT != "inferior frontal" & DKT != "temporal pole" & DKT != "subcortical") %>%
+  rename(region = DKT, p = PValue_Interaction, B = Estimate_Interaction)
+
+# Apply FDR correction
+slope_tibble$p_corrected <- p.adjust(slope_tibble$p, method = "fdr")
+
+# Do the same thing above but for offset
+df_duplicated_offset <- bind_rows(replicate(3, results_df_offset, simplify = FALSE))
+
+# Filter rows that need duplication, adjust DKT column and other columns accordingly
+df_duplicated_offset <- df_duplicated_offset %>%
+  mutate(duplicate = row_number()) %>%
+  left_join(df_labels, by = "DKT") %>%
+  mutate(DKT = ifelse(!is.na(new_label), new_label, DKT)) %>%
+  select(-new_label) %>%
+  filter(!is.na(duplicate)) %>%
+  group_by(duplicate) %>%
+  slice(rep(1:n(), each = 3)) %>%
+  ungroup() %>%
+  select(-duplicate)
+
+# Combine with the original data frame and remove duplicates
+df_final_offset <- bind_rows(df_duplicated_offset, results_df_offset)
+df_final_offset <- distinct(df_final_offset)
+
+# convert data frame to tibble and remove labels which are not in DKT atlas
+offset_tibble <- tibble(df_final_offset) %>%
+  select(DKT, PValue_Offset, Estimate_Offset) %>% 
+  filter(DKT != "inferior frontal" & DKT != "subcortical") %>%
+  rename(region = DKT, p = PValue_Offset, B = Estimate_Offset)
+
+```
+
+# Generate cortical atlas plots
+## here we are plotting the significant interaction (slope x age) on memory for slope and not offset, given that offset did not show any significant interactions
+
+```{r cortical atlas plots}
+
+# generate cortical plot for slope
+ggplot(slope_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = B, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  scale_fill_viridis_c(option = "magma") +  # Adjust scale limits
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+
+```
+
+# Plot the interaction for slope
+## plot the significant two-way interactions on a scatterplot for slope
+
+```{r plot significant regions slope x age}
+
+ggplot(filter(average_df, DKT == "fusiform"), aes(x=Slope, y=memory, color = age)) + 
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "Age [years]") +
+  labs(y="Recognition Accuracy", x = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+ggplot(filter(average_df, DKT == "rostral middle frontal"), aes(x=age, y=Slope, color = memory)) + 
+  geom_point(alpha = .5, size = 3) +
+  geom_smooth(method = "lm", linetype="solid", colour = "gray50") +
+  scale_color_gradient(low = "#0091ff", high = "#f0650e", name = "memory") +
+  labs(x="Age [years]", y = "Aperiodic Slope") +
+  scale_x_continuous(breaks=number_ticks(6)) +
+  scale_y_continuous(breaks=number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
+
+# Plot main effect of age (offset)
+
+```{r plot significant offset main effect}
+
+# Plot main effect (rostral middle frontal)
+ggplot(filter(average_df, DKT == "rostral middle frontal"), aes(x = Offset, y = memory)) + 
+  geom_point(alpha = 0.5, size = 3, color = "#38618c") +
+  geom_smooth(method = "lm", linetype = "solid", colour = "#38618c") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "#38618c", alpha = 0.1) +  # Shade SE in blue
+  labs(x = "Aperiodic Offset", y = "Recognition Accuracy") +
+  scale_x_continuous(breaks = number_ticks(6)) +
+  scale_y_continuous(breaks = number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# Plot main effect (inferior parietal)
+ggplot(filter(average_df, DKT == "inferior parietal"), aes(x = Offset, y = memory)) + 
+  geom_point(alpha = 0.5, size = 3, color = "#38618c") +
+  geom_smooth(method = "lm", linetype = "solid", colour = "#38618c") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "#38618c", alpha = 0.1) +  # Shade SE in blue
+  labs(x = "Aperiodic Offset", y = "Recognition Accuracy") +
+  scale_x_continuous(breaks = number_ticks(6)) +
+  scale_y_continuous(breaks = number_ticks(10)) +
+  theme_classic()  +
+  theme(legend.position="right",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill=alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+# generate cortical plot for offset
+ggplot(offset_tibble) +
+  geom_brain(
+    atlas = dkt, 
+    position = position_brain(hemi ~ side),
+    aes(fill = B, color = "transparent")) +  # Set color to transparent to remove region boundaries
+  #scale_fill_viridis_c(option = "magma") +  # Use inferno palette
+  scale_fill_viridis_c(option = "magma") +  # Adjust scale limits
+  scale_color_manual(values = "transparent") +  # Set color to transparent
+  theme_void() +
+  theme(legend.position = "right",
+        plot.title = element_text(size=14, face="bold"))
+
+```
+
+# Resting-state memory analysis (slope)
+
+```{r resting state memory}
+
+# Linear mixed-effects model function for looping over DKT regions
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  model <- lm(memory ~ Slope * age, data = data)
+  emm <- ggemmeans(model, terms = c("Slope", "age"),
+                     ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(memory_rest$DKT)
+combined_results_slope_rest <- data.frame()  # Create an empty data frame for combined results
+results_df_slope_rest <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- memory_rest[memory_rest$DKT == level, ]
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results_slope_rest <- rbind(combined_results_slope_rest, results)
+  
+  # Run lmer model for slope results
+  model <- lm(memory ~ Slope * age, data = subset_data)
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for slope
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Slope = fixed_effects[1, "Estimate"],
+    SE_Slope = fixed_effects[1, "Std. Error"],
+    PValue_Slope = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_Age = fixed_effects[2, "Estimate"],
+    SE_Age = fixed_effects[2, "Std. Error"],
+    PValue_Age = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for slope
+  results_df_slope_rest <- rbind(results_df_slope_rest, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results_slope_rest <- combined_results_slope_rest %>% 
+  rename(memory = predicted, Slope = x, age = group)
+
+# generate table of all results for aperiodic slope
+slope_rest_table <- results_df_slope_rest %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_Slope = PValue_Slope,
+                P_Interaction = PValue_Interaction)
+
+```
+
+# Plot main effect of resting slope
+
+```{r plot slope resting}
+
+ggplot(memory_rest, aes(x = Slope, y = memory)) + 
+  geom_point(color = "brown3", alpha = 0.6, size = 3) +  # Change to brick red
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  #scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = .2)) +
+  #scale_x_continuous(limits = c(1.25, 3), breaks = seq(1.25, 3, by = .35)) +
+  facet_wrap(~DKT) +
+  scale_color_viridis_c(option = "magma") +
+  xlab("Aperiodic Slope") + ylab ("Recognition Accuracy") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold")) 
+
+```
+
+# Resting-state memory analysis (offset)
+
+```{r resting state memory}
+# Linear mixed-effects model function for looping over DKT regions
+
+run_lmm_and_extract_effects <- function(data) {
+  data <- na.omit(data)  # Filter out rows with missing values
+  model <- lm(memory ~ Offset * age, data = data)
+  emm <- ggemmeans(model, terms = c("Offset", "age"),
+                     ci.lvl = 0.83)
+  
+  return(as.data.frame(emm))
+}
+
+# Create an empty list to populate with DKT labels
+DKT_levels <- unique(memory_rest$DKT)
+combined_results_Offset_rest <- data.frame()  # Create an empty data frame for combined results
+results_df_Offset_rest <- data.frame()  # Create an empty data frame for results
+
+# Apply lmer function to each DKT area
+for (level in DKT_levels) {
+  cat("Processing DKT level:", level, "\n")  # Print the current DKT level
+  
+  # Subset the data
+  subset_data <- memory_rest[memory_rest$DKT == level, ]
+  # Run lmer model and extract effects
+  results <- run_lmm_and_extract_effects(subset_data)
+  # Add the DKT level as a column in the results
+  results$DKT <- level
+  # Append results to combined_results
+  combined_results_Offset_rest <- rbind(combined_results_Offset_rest, results)
+  
+  # Run lmer model for Offset results
+  model <- lm(memory ~ Offset * age, data = subset_data)
+  
+  summary_model <- summary(model)
+  
+  # Extract estimates, standard errors, and p-values for the fixed effects
+  fixed_effects <- summary_model$coefficients[c(2, 3, 4), ]
+  
+  # Create a new data frame to store the results for Offset
+  result_row <- data.frame(
+    DKT = level,
+    Estimate_Offset = fixed_effects[1, "Estimate"],
+    SE_Offset = fixed_effects[1, "Std. Error"],
+    PValue_Offset = fixed_effects[1, "Pr(>|t|)"],
+    Estimate_Age = fixed_effects[2, "Estimate"],
+    SE_Age = fixed_effects[2, "Std. Error"],
+    PValue_Age = fixed_effects[2, "Pr(>|t|)"],
+    Estimate_Interaction = fixed_effects[3, "Estimate"],
+    SE_Interaction = fixed_effects[3, "Std. Error"],
+    PValue_Interaction = fixed_effects[3, "Pr(>|t|)"]
+  )
+  
+  # Append the results to the main data frame for Offset
+  results_df_Offset_rest <- rbind(results_df_Offset_rest, result_row)
+}
+
+# Combine the results into a single data frame
+combined_results_Offset_rest <- combined_results_Offset_rest %>% 
+  rename(memory = predicted, Offset = x, age = group)
+
+# generate table of all results for aperiodic Offset
+Offset_rest_table <- results_df_Offset_rest %>% 
+  dplyr::rename(ROI = DKT, P_Age = PValue_Age, P_Offset = PValue_Offset,
+                P_Interaction = PValue_Interaction)
+
+```
+
+# Plot main effect of resting offset
+
+```{r plot offset resting}
+
+ggplot(memory_rest, aes(x = Offset, y = memory)) + 
+  geom_jitter(width = 6, color = "dodgerblue3", alpha = 0.6, size = 3) +  
+  geom_smooth(method = "lm", linetype = "solid", color = "darkgray") +
+  geom_ribbon(aes(ymin = ..ymin.., ymax = ..ymax..), 
+              stat = "smooth", method = "lm", fill = "darkgray", alpha = 0.1) +
+  #scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = .2)) +
+  #scale_x_continuous(limits = c(1.25, 3), breaks = seq(1.25, 3, by = .35)) +
+  facet_wrap(~DKT) +
+  scale_color_viridis_c(option = "magma") +
+  xlab("Aperiodic Offset") + ylab("Recognition Accuracy") +
+  theme_classic() +
+  theme(legend.position = "none",
+        legend.spacing.x = unit(0.1, 'cm'),
+        legend.key.size = unit(0.5, "cm"),
+        legend.background = element_rect(fill = alpha('blue', 0)),
+        legend.text = element_text(size = 10, colour = "black"),
+        legend.title = element_text(size = 12, colour = "black"),
+        strip.text.x = element_text(size = 12, colour = "black"),
+        strip.text.y = element_text(size = 12, colour = "black"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(size = 10, face = "bold"))
+
+```
